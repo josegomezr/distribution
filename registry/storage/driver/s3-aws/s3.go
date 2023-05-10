@@ -20,7 +20,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
@@ -1118,97 +1117,104 @@ func (d *driver) Walk(ctx context.Context, from string, f storagedriver.WalkFn, 
 		return err
 	}
 
+	// S3 doesn't have the concept of empty directories, so it'll return path not found if there are no objects
+	if objectCount == 0 {
+		return storagedriver.PathNotFoundError{Path: from}
+	}
+
 	return nil
 }
 
-func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, from string, startAfter string, f storagedriver.WalkFn) error {
-	var (
-		retError error
-		// the most recent directory walked for de-duping
-		prevDir string
-		// the most recent skip directory to avoid walking over undesirable files
-		prevSkipDir string
-	)
-	prevDir = from
+func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, opath, prefix string, f storagedriver.WalkFn) error {
+	var retError error
 
-	path := from
-	if !strings.HasSuffix(path, "/") {
-		path = path + "/"
-	}
+	// Using Delimiter here allows for directories to be grouped into
+	// .CommonPrefixes below in the page handler effectively separating directories from files.
 
-	prefix := ""
-	if d.s3Path("") == "" {
-		prefix = "/"
-	}
-
+	path := strings.Trim(opath, "/")
+	path = path + "/"
 	listObjectsInput := &s3.ListObjectsV2Input{
-		Bucket:     aws.String(d.Bucket),
-		Prefix:     aws.String(d.s3Path(path)),
-		MaxKeys:    aws.Int64(listMax),
-		StartAfter: aws.String(d.s3Path(startAfter)),
+		Bucket:    aws.String(d.Bucket),
+		Prefix:    aws.String(path),
+		Delimiter: aws.String("/"),
+		MaxKeys:   aws.Int64(listMax),
 	}
 
 	ctx, done := dcontext.WithTrace(parentCtx)
 	defer done("s3aws.ListObjectsV2PagesWithContext(%s)", listObjectsInput)
 
-	// When the "delimiter" argument is omitted, the S3 list API will list all objects in the bucket
-	// recursively, omitting directory paths. Objects are listed in sorted, depth-first order so we
-	// can infer all the directories by comparing each object path to the last one we saw.
-	// See: https://docs.aws.amazon.com/AmazonS3/latest/userguide/ListingKeysUsingAPIs.html
-
-	// With files returned in sorted depth-first order, directories are inferred in the same order.
-	// ErrSkipDir is handled by explicitly skipping over any files under the skipped directory. This may be sub-optimal
-	// for extreme edge cases but for the general use case in a registry, this is orders of magnitude
-	// faster than a more explicit recursive implementation.
 	listObjectErr := d.S3.ListObjectsV2PagesWithContext(ctx, listObjectsInput, func(objects *s3.ListObjectsV2Output, lastPage bool) bool {
-		walkInfos := make([]storagedriver.FileInfoInternal, 0, len(objects.Contents))
+		var count int64
+		// KeyCount was introduced with version 2 of the GET Bucket operation in S3.
+		// Some S3 implementations don't support V2 now, so we fall back to manual
+		// calculation of the key count if required
+		if objects.KeyCount != nil {
+			count = *objects.KeyCount
+		} else {
+			count = int64(len(objects.Contents) + len(objects.CommonPrefixes))
+		}
 
-		for _, file := range objects.Contents {
-			filePath := strings.Replace(*file.Key, d.s3Path(""), prefix, 1)
+		walkInfos := make([]s3FileInfoFieldsContainer, 0, count)
+		// Iterate over "folders" and build the FileInfo
+		for _, dir := range objects.CommonPrefixes {
+			commonPrefix := *dir.Prefix
 
-			// get a list of all inferred directories between the previous directory and this file
-			dirs := directoryDiff(prevDir, filePath)
-			for _, dir := range dirs {
-				walkInfos = append(walkInfos, storagedriver.FileInfoInternal{
-					FileInfoFields: storagedriver.FileInfoFields{
-						IsDir: true,
-						Path:  dir,
-					},
-				})
-				prevDir = dir
+			path := strings.Replace(strings.TrimRight(commonPrefix, "/"), d.s3Path(""), prefix, 1)
+			if !strings.HasPrefix(path, "/") {
+				path = "/" + path
 			}
-
-			walkInfos = append(walkInfos, storagedriver.FileInfoInternal{
+			walkInfos = append(walkInfos, s3FileInfoFieldsContainer{
+				prefix: dir.Prefix,
 				FileInfoFields: storagedriver.FileInfoFields{
-					IsDir:   false,
-					Size:    *file.Size,
-					ModTime: *file.LastModified,
-					Path:    filePath,
+					IsDir: true,
+					Path:  path,
 				},
 			})
 		}
 
-		for _, walkInfo := range walkInfos {
-			// skip any results under the last skip directory
-			if prevSkipDir != "" && strings.HasPrefix(walkInfo.Path(), prevSkipDir) {
-				continue
-			}
+		// Iterate over all files now
+		for _, file := range objects.Contents {
+			walkInfos = append(walkInfos, s3FileInfoFieldsContainer{
+				FileInfoFields: storagedriver.FileInfoFields{
+					IsDir:   false,
+					Size:    *file.Size,
+					ModTime: *file.LastModified,
+					Path:    strings.Replace(*file.Key, d.s3Path(""), prefix, 1),
+				},
+			})
+		}
 
+		// Sort all files before iterating. This is to guarantee that when a directory
+		// is skipped, all it's descendant directories are also skipped.
+		sort.SliceStable(walkInfos, func(i, j int) bool {
+			return walkInfos[i].FileInfoFields.Path < walkInfos[j].FileInfoFields.Path
+		})
+
+		for _, walkInfo := range walkInfos {
 			err := f(walkInfo)
 			*objectCount++
 
-			if err != nil {
-				if err == storagedriver.ErrSkipDir {
-					prevSkipDir = walkInfo.Path()
+			if err == storagedriver.ErrFilledBuffer {
+				return false
+			}else if err == storagedriver.ErrSkipDir {
+				if walkInfo.IsDir() {
 					continue
+				} else {
+					break
 				}
-				if err == storagedriver.ErrFilledBuffer {
-					return false
-				}
+			} else if err != nil {
 				retError = err
 				return false
 			}
+
+			if walkInfo.IsDir() {
+				if err := d.doWalk(ctx, objectCount, *walkInfo.prefix, prefix, f); err != nil {
+					retError = err
+					return false
+				}
+			}
 		}
+
 		return true
 	})
 
@@ -1221,50 +1227,6 @@ func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, from stri
 	}
 
 	return nil
-}
-
-// directoryDiff finds all directories that are not in common between
-// the previous and current paths in sorted order.
-//
-// # Examples
-//
-//	directoryDiff("/path/to/folder", "/path/to/folder/folder/file")
-//	// => [ "/path/to/folder/folder" ]
-//
-//	directoryDiff("/path/to/folder/folder1", "/path/to/folder/folder2/file")
-//	// => [ "/path/to/folder/folder2" ]
-//
-//	directoryDiff("/path/to/folder/folder1/file", "/path/to/folder/folder2/file")
-//	// => [ "/path/to/folder/folder2" ]
-//
-//	directoryDiff("/path/to/folder/folder1/file", "/path/to/folder/folder2/folder1/file")
-//	// => [ "/path/to/folder/folder2", "/path/to/folder/folder2/folder1" ]
-//
-//	directoryDiff("/", "/path/to/folder/folder/file")
-//	// => [ "/path", "/path/to", "/path/to/folder", "/path/to/folder/folder" ]
-func directoryDiff(prev, current string) []string {
-	var paths []string
-
-	if prev == "" || current == "" {
-		return paths
-	}
-
-	parent := current
-	for {
-		parent = filepath.Dir(parent)
-		if parent == "/" || parent == prev || strings.HasPrefix(prev+"/", parent+"/") {
-			break
-		}
-		paths = append(paths, parent)
-	}
-	reverse(paths)
-	return paths
-}
-
-func reverse(s []string) {
-	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
-		s[i], s[j] = s[j], s[i]
-	}
 }
 
 func (d *driver) s3Path(path string) string {
