@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/distribution/distribution/v3"
-	dcontext "github.com/distribution/distribution/v3/context"
+	"github.com/distribution/distribution/v3/internal/dcontext"
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/opencontainers/go-digest"
 	"github.com/sirupsen/logrus"
@@ -57,7 +57,7 @@ func (bw *blobWriter) StartedAt() time.Time {
 func (bw *blobWriter) Commit(ctx context.Context, desc distribution.Descriptor) (distribution.Descriptor, error) {
 	dcontext.GetLogger(ctx).Debug("(*blobWriter).Commit")
 
-	if err := bw.fileWriter.Commit(); err != nil {
+	if err := bw.fileWriter.Commit(ctx); err != nil {
 		return distribution.Descriptor{}, err
 	}
 
@@ -230,7 +230,7 @@ func (bw *blobWriter) validateBlob(ctx context.Context, desc distribution.Descri
 	}
 
 	if fullHash {
-		// a fantastic optimization: if the the written data and the size are
+		// a fantastic optimization: if the written data and the size are
 		// the same, we don't need to read the data from the backend. This is
 		// because we've written the entire file in the lifecycle of the
 		// current instance.

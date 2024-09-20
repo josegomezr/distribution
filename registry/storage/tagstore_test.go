@@ -6,11 +6,11 @@ import (
 	"testing"
 
 	"github.com/distribution/distribution/v3"
-	"github.com/distribution/distribution/v3/manifest"
 	"github.com/distribution/distribution/v3/manifest/schema2"
-	"github.com/distribution/distribution/v3/reference"
 	"github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
+	"github.com/distribution/reference"
 	digest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/specs-go"
 )
 
 type tagsTestEnv struct {
@@ -178,7 +178,7 @@ func TestTagLookup(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(tags) != 0 {
-		t.Fatalf("Lookup returned > 0 tags from empty store")
+		t.Fatal("Lookup returned > 0 tags from empty store")
 	}
 
 	err = tagStore.Tag(ctx, "a", descA)
@@ -243,10 +243,8 @@ func TestTagIndexes(t *testing.T) {
 			t.Fatal(err)
 		}
 		m := schema2.Manifest{
-			Versioned: manifest.Versioned{
-				SchemaVersion: 2,
-				MediaType:     schema2.MediaTypeManifest,
-			},
+			Versioned: specs.Versioned{SchemaVersion: 2},
+			MediaType: schema2.MediaTypeManifest,
 			Config: distribution.Descriptor{
 				Digest:    conf.Digest,
 				Size:      1,
