@@ -1125,17 +1125,14 @@ func (d *driver) Walk(ctx context.Context, from string, f storagedriver.WalkFn, 
 	return nil
 }
 
-func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, opath, prefix string, f storagedriver.WalkFn) error {
+func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, from string, startAfter string, f storagedriver.WalkFn) error {
 	var retError error
 
 	// Using Delimiter here allows for directories to be grouped into
 	// .CommonPrefixes below in the page handler effectively separating directories from files.
-
-	path := strings.Trim(opath, "/")
-	path = path + "/"
 	listObjectsInput := &s3.ListObjectsV2Input{
 		Bucket:    aws.String(d.Bucket),
-		Prefix:    aws.String(path),
+		Prefix:    aws.String(strings.TrimLeft(from, "/")),
 		Delimiter: aws.String("/"),
 		MaxKeys:   aws.Int64(listMax),
 	}
@@ -1158,16 +1155,13 @@ func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, opath, pr
 		// Iterate over "folders" and build the FileInfo
 		for _, dir := range objects.CommonPrefixes {
 			commonPrefix := *dir.Prefix
+			walkPath := strings.Replace(commonPrefix[:len(commonPrefix)-1], d.s3Path(""), startAfter, 1)
 
-			path := strings.Replace(strings.TrimRight(commonPrefix, "/"), d.s3Path(""), prefix, 1)
-			if !strings.HasPrefix(path, "/") {
-				path = "/" + path
-			}
 			walkInfos = append(walkInfos, s3FileInfoFieldsContainer{
 				prefix: dir.Prefix,
 				FileInfoFields: storagedriver.FileInfoFields{
 					IsDir: true,
-					Path:  path,
+					Path:  walkPath,
 				},
 			})
 		}
@@ -1179,7 +1173,7 @@ func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, opath, pr
 					IsDir:   false,
 					Size:    *file.Size,
 					ModTime: *file.LastModified,
-					Path:    strings.Replace(*file.Key, d.s3Path(""), prefix, 1),
+					Path:    strings.Replace(*file.Key, d.s3Path(""), startAfter, 1),
 				},
 			})
 		}
@@ -1193,10 +1187,9 @@ func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, opath, pr
 		for _, walkInfo := range walkInfos {
 			err := f(walkInfo)
 			*objectCount++
-
 			if err == storagedriver.ErrFilledBuffer {
 				return false
-			}else if err == storagedriver.ErrSkipDir {
+			} else if err == storagedriver.ErrSkipDir {
 				if walkInfo.IsDir() {
 					continue
 				} else {
@@ -1208,7 +1201,7 @@ func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, opath, pr
 			}
 
 			if walkInfo.IsDir() {
-				if err := d.doWalk(ctx, objectCount, *walkInfo.prefix, prefix, f); err != nil {
+				if err := d.doWalk(ctx, objectCount, *walkInfo.prefix, startAfter, f); err != nil {
 					retError = err
 					return false
 				}
