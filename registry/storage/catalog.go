@@ -149,7 +149,7 @@ func compareReplaceInline(s1, s2 string, old, new byte) int {
 // storage.
 func handleRepository(fileInfo driver.FileInfo, root, last string, fn func(repoPath string) error) error {
 	filePath := fileInfo.Path()
-	root = strings.Trim(root, "/") + "/"
+	root = strings.TrimRight(root, "/") + "/"
 	repo := strings.TrimPrefix(filePath, root)
 
 	_, file := path.Split(repo)
