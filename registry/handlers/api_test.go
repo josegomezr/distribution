@@ -189,6 +189,13 @@ func TestCatalogAPI(t *testing.T) {
 		t.Fatalf("repositories returned unexpected entries (expected: %d, returned: %d)", expectedRemainder, len(ctlg.Repositories))
 	}
 
+	// it must return the first maxEntries entries from the catalog
+	for _, image := range allCatalog[maxEntries:] {
+		if !contains(ctlg.Repositories, image) {
+			t.Fatalf("didn't find our repository '%s' in the catalog", image)
+		}
+	}
+
 	// -----------------------------------
 	// Case No. 3: request n = maxentries
 	values = url.Values{
